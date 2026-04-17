@@ -50,6 +50,7 @@ export async function GET(req: NextRequest) {
         Cookie: cookie,
         "User-Agent": "Mozilla/5.0",
       },
+      cache: "no-store",
     });
 
     if (!res.ok) {
@@ -80,9 +81,11 @@ export async function GET(req: NextRequest) {
       marketState: meta.currentTradingPeriod?.regular ? "REGULAR" : "CLOSED",
     };
 
+    console.log(`[quote] ${ticker}: price=${quote.price} open=${quote.open} high=${quote.high} low=${quote.low} vol=${quote.volume} state=${quote.marketState}`);
+
     return NextResponse.json(quote, {
       headers: {
-        "Cache-Control": "s-maxage=10, stale-while-revalidate=20",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
       },
     });
   } catch (error: any) {

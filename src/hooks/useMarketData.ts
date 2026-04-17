@@ -9,19 +9,23 @@ export function useMarketData(ticker: string, timeframe: Timeframe) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const quoteInterval = useRef<NodeJS.Timeout | null>(null);
+  const lastRefetchRef = useRef(0);
+  const latestCandleTimeRef = useRef(0);
 
-  const fetchCandles = useCallback(async () => {
+  const fetchCandles = useCallback(async (silent = false) => {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const res = await fetch(`/api/history?ticker=${ticker}&interval=${timeframe}`);
       if (!res.ok) throw new Error("Failed to fetch candles");
       const data = await res.json();
-      setCandles(data.candles || []);
+      const next: Candle[] = data.candles || [];
+      setCandles(next);
+      if (next.length > 0) latestCandleTimeRef.current = next[next.length - 1].time;
       setError(null);
     } catch (err: any) {
       setError(err.message);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [ticker, timeframe]);
 
@@ -32,33 +36,47 @@ export function useMarketData(ticker: string, timeframe: Timeframe) {
       const data = await res.json();
       setQuote(data);
 
-      // Update the last candle with latest price (new array so Chart re-renders)
+      // Update the last candle's close/high/low with the latest price.
+      // New candles are never synthesized here — they come from Yahoo on refetch.
       setCandles((prev) => {
         if (prev.length === 0 || !data.price) return prev;
         const last = prev[prev.length - 1];
         const newClose = data.price;
         const newHigh = Math.max(last.high, newClose);
         const newLow = Math.min(last.low, newClose);
-        // Skip update if nothing changed
         if (last.close === newClose && last.high === newHigh && last.low === newLow) {
           return prev;
         }
         return [...prev.slice(0, -1), { ...last, close: newClose, high: newHigh, low: newLow }];
       });
+
+      // If the current wall clock has crossed into a new interval bucket past
+      // the last known candle, refetch history so Yahoo's new candle appears.
+      const intervalSec = timeframe === "1m" ? 60 : 900;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const lastTime = latestCandleTimeRef.current;
+      if (
+        lastTime > 0 &&
+        nowSec >= lastTime + intervalSec &&
+        nowSec - lastRefetchRef.current >= 15
+      ) {
+        lastRefetchRef.current = nowSec;
+        fetchCandles(true);
+      }
     } catch (err: any) {
       console.error("Quote fetch error:", err.message);
     }
-  }, [ticker]);
+  }, [ticker, timeframe, fetchCandles]);
 
   // Fetch candles on mount and timeframe change
   useEffect(() => {
     fetchCandles();
   }, [fetchCandles]);
 
-  // Poll quote every 15 seconds
+  // Poll quote every 5 seconds for near-real-time price updates
   useEffect(() => {
     fetchQuote();
-    quoteInterval.current = setInterval(fetchQuote, 15000);
+    quoteInterval.current = setInterval(fetchQuote, 5000);
     return () => {
       if (quoteInterval.current) clearInterval(quoteInterval.current);
     };

@@ -50,6 +50,7 @@ export async function GET(req: NextRequest) {
         Cookie: cookie,
         "User-Agent": "Mozilla/5.0",
       },
+      cache: "no-store",
     });
 
     if (!res.ok) {

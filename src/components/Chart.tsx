@@ -63,16 +63,11 @@ export default function Chart({ candles, loading }: ChartProps) {
     return calculateVolumeProfile(candles, 40);
   }, [candles, showVolumeProfile]);
 
-  // Get price range for volume profile positioning
-  const priceRange = useMemo(() => {
-    if (candles.length === 0) return { min: 0, max: 0 };
-    let min = Infinity, max = -Infinity;
-    for (const c of candles) {
-      min = Math.min(min, c.low);
-      max = Math.max(max, c.high);
-    }
-    return { min, max };
-  }, [candles]);
+  // Positioned bins in pixel coordinates, recomputed on zoom/pan/resize so
+  // each bar sits at its actual price level on the chart.
+  const [positionedBins, setPositionedBins] = useState<
+    { top: number; height: number; price: number; pct: number }[]
+  >([]);
 
   // Initialize chart
   useEffect(() => {
@@ -170,13 +165,75 @@ export default function Chart({ candles, loading }: ChartProps) {
     };
   }, []);
 
-  // Track previous candle count to distinguish full loads from quote updates
+  // Track previous candle count and last candle to distinguish full loads from quote updates
   const prevCandleCountRef = useRef(0);
+  const prevLastCandleRef = useRef<Candle | null>(null);
 
-  // Full data load — runs when candle count changes (new fetch) or indicators toggle
+  // Full data load — runs on new dataset or indicator toggle
   useEffect(() => {
     if (!candleSeriesRef.current || candles.length === 0) return;
 
+    const prevCount = prevCandleCountRef.current;
+    const countDelta = candles.length - prevCount;
+    // Full reload only on initial load or when the dataset shrinks/grows by more than one
+    const isNewDataset = prevCount === 0 || countDelta < 0 || countDelta > 1;
+
+    // Incremental update: either new candle appended (+1) or last candle changed
+    if (!isNewDataset && prevLastCandleRef.current) {
+      const last = candles[candles.length - 1];
+      const prev = prevLastCandleRef.current;
+      const changed =
+        countDelta === 1 ||
+        last.close !== prev.close ||
+        last.high !== prev.high ||
+        last.low !== prev.low;
+
+      if (changed) {
+        const nyTime = toNewYorkTime(last.time) as Time;
+
+        // Update just the last bar in-place — no scroll, no full redraw
+        candleSeriesRef.current.update({
+          time: nyTime,
+          open: last.open,
+          high: last.high,
+          low: last.low,
+          close: last.close,
+        });
+
+        volumeSeriesRef.current?.update({
+          time: nyTime,
+          value: last.volume,
+          color: last.close >= last.open ? "#00ff8820" : "#ff336620",
+        });
+
+        // Update last point of indicators
+        if (showEMA) {
+          const ema9Data = calculateEMA(candles, 9);
+          const ema21Data = calculateEMA(candles, 21);
+          if (ema9Data.length > 0) {
+            const e9 = ema9Data[ema9Data.length - 1];
+            ema9Ref.current?.update({ time: toNewYorkTime(e9.time) as Time, value: e9.value });
+          }
+          if (ema21Data.length > 0) {
+            const e21 = ema21Data[ema21Data.length - 1];
+            ema21Ref.current?.update({ time: toNewYorkTime(e21.time) as Time, value: e21.value });
+          }
+        }
+        if (showVWAP) {
+          const vwapData = calculateVWAP(candles);
+          if (vwapData.length > 0) {
+            const v = vwapData[vwapData.length - 1];
+            vwapRef.current?.update({ time: toNewYorkTime(v.time) as Time, value: v.value });
+          }
+        }
+
+        prevLastCandleRef.current = candles[candles.length - 1];
+        prevCandleCountRef.current = candles.length;
+        return;
+      }
+    }
+
+    // Full data load path
     const candleData: CandlestickData[] = candles.map((c) => ({
       time: toNewYorkTime(c.time) as Time,
       open: c.open,
@@ -222,13 +279,57 @@ export default function Chart({ candles, loading }: ChartProps) {
       vwapRef.current?.setData([]);
     }
 
-    // Only scroll to latest on initial load or when ticker/timeframe changes (candle count changes)
-    const isNewDataset = candles.length !== prevCandleCountRef.current;
+    // Only scroll to latest on initial load or when ticker/timeframe changes
     prevCandleCountRef.current = candles.length;
+    prevLastCandleRef.current = candles[candles.length - 1];
     if (isNewDataset) {
       chartRef.current?.timeScale().scrollToRealTime();
     }
   }, [candles, showEMA, showVWAP]);
+
+  // Align volume-profile bins to actual y-pixel of each price level using the
+  // chart's priceToCoordinate — so bins track zoom/pan and don't suggest
+  // liquidity at prices outside the visible range.
+  useEffect(() => {
+    if (!chartRef.current || !candleSeriesRef.current) return;
+    if (!showVolumeProfile || volumeProfile.length === 0) {
+      setPositionedBins([]);
+      return;
+    }
+
+    const series = candleSeriesRef.current;
+    const binSize =
+      volumeProfile.length > 1
+        ? volumeProfile[1].price - volumeProfile[0].price
+        : 0;
+
+    const recompute = () => {
+      const next: { top: number; height: number; price: number; pct: number }[] = [];
+      for (const bin of volumeProfile) {
+        const yTop = series.priceToCoordinate(bin.price + binSize / 2);
+        const yBot = series.priceToCoordinate(bin.price - binSize / 2);
+        if (yTop == null || yBot == null) continue;
+        const top = Math.min(yTop, yBot);
+        const height = Math.max(1, Math.abs(yBot - yTop));
+        next.push({ top, height, price: bin.price, pct: bin.pct });
+      }
+      setPositionedBins(next);
+    };
+
+    recompute();
+
+    const timeScale = chartRef.current.timeScale();
+    const onRange = () => recompute();
+    timeScale.subscribeVisibleLogicalRangeChange(onRange);
+
+    const ro = new ResizeObserver(recompute);
+    if (containerRef.current) ro.observe(containerRef.current);
+
+    return () => {
+      timeScale.unsubscribeVisibleLogicalRangeChange(onRange);
+      ro.disconnect();
+    };
+  }, [volumeProfile, showVolumeProfile, candles]);
 
   return (
     <div className="relative flex-1 h-full">
@@ -266,25 +367,31 @@ export default function Chart({ candles, loading }: ChartProps) {
         </button>
       </div>
 
-      {/* Volume Profile Overlay */}
-      {showVolumeProfile && volumeProfile.length > 0 && (
+      {/* Volume Profile Overlay — bins positioned at actual y-pixel of their price */}
+      {showVolumeProfile && positionedBins.length > 0 && (
         <div
-          className="absolute right-12 top-[10%] bottom-[25%] z-[5] pointer-events-none"
+          className="absolute right-12 top-0 bottom-0 z-[5] pointer-events-none"
           style={{ width: "120px" }}
         >
-          <div className="relative h-full flex flex-col-reverse justify-between">
-            {volumeProfile.map((bin, i) => (
+          {positionedBins.map((bin, i) => {
+            const lastClose = candles[candles.length - 1]?.close || 0;
+            return (
               <div
                 key={i}
-                className="flex items-center justify-end"
-                style={{ height: `${100 / volumeProfile.length}%` }}
+                className="absolute right-0 flex items-center justify-end"
+                style={{
+                  top: `${bin.top}px`,
+                  height: `${bin.height}px`,
+                  width: "100%",
+                }}
               >
                 <div
-                  className="h-[80%] rounded-l"
+                  className="rounded-l"
                   style={{
                     width: `${bin.pct * 100}%`,
+                    height: `${Math.max(1, bin.height - 1)}px`,
                     backgroundColor:
-                      bin.price >= (candles[candles.length - 1]?.close || 0)
+                      bin.price >= lastClose
                         ? "rgba(0, 255, 136, 0.12)"
                         : "rgba(255, 51, 102, 0.12)",
                     borderLeft:
@@ -294,8 +401,8 @@ export default function Chart({ candles, loading }: ChartProps) {
                   }}
                 />
               </div>
-            ))}
-          </div>
+            );
+          })}
         </div>
       )}
 
